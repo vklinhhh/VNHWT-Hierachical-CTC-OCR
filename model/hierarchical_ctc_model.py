@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration Class ---
 class HierarchicalCtcOcrConfig(PretrainedConfig):
-    model_type = "hierarchical_ctc_ocr"
+    model_type = "hierarchical_ctc_ocr_multiscale"
 
     def __init__(
         self,
@@ -26,6 +26,9 @@ class HierarchicalCtcOcrConfig(PretrainedConfig):
         base_char_vocab=None, # For size of base head
         diacritic_vocab=None, # For size of potential diacritic head / conditioning
         combined_char_vocab=None, # Combined chars 'a','á','à' for FINAL CTC output
+        vision_encoder_layer_indices=[-1, -4], # Indices of layers to fuse (e.g., last and 4th-to-last)
+                                               # Adjust based on encoder architecture (e.g., ViT has 12/24 layers)
+        feature_fusion_method="concat_proj", # Options: 'concat_proj', 'add', 'bilinear'
         # Intermediate layers
         intermediate_rnn_layers=2,
         rnn_hidden_size=512,
@@ -52,7 +55,12 @@ class HierarchicalCtcOcrConfig(PretrainedConfig):
         self.base_char_vocab_size = len(self.base_char_vocab)
         self.diacritic_vocab_size = len(self.diacritic_vocab)
         self.combined_char_vocab_size = len(self.combined_char_vocab) # Final output size
-
+        if not isinstance(vision_encoder_layer_indices, list) or len(vision_encoder_layer_indices) < 2:
+             logger.warning("vision_encoder_layer_indices must be a list of at least two indices. Defaulting to [-1, -4].")
+             self.vision_encoder_layer_indices = [-1, -4]
+        else:
+             self.vision_encoder_layer_indices = sorted(list(set(vision_encoder_layer_indices))) # Sort and unique
+        self.feature_fusion_method = feature_fusion_method
         self.intermediate_rnn_layers = intermediate_rnn_layers
         self.rnn_hidden_size = rnn_hidden_size
         self.rnn_dropout = rnn_dropout
@@ -70,7 +78,7 @@ class HierarchicalCtcOcrConfig(PretrainedConfig):
 
 
 # --- Model Class ---
-class HierarchicalCtcOcrModel(PreTrainedModel):
+class HierarchicalCtcMultiScaleOcrModel(PreTrainedModel):
     config_class = HierarchicalCtcOcrConfig
 
     def __init__(self, config: HierarchicalCtcOcrConfig):
@@ -102,9 +110,37 @@ class HierarchicalCtcOcrModel(PreTrainedModel):
             del base_model
         except Exception as e:
             logger.error(f"Failed loading base components: {e}", exc_info=True); raise
+            
+        # --- Feature Fusion Layer ---
+        encoder_output_size = self.config.vision_encoder_config.hidden_size
+        num_fusion_layers = len(config.vision_encoder_layer_indices)
+        fusion_input_size = encoder_output_size * num_fusion_layers # Default for concat
+
+        if config.feature_fusion_method == "concat_proj":
+            # Project concatenated features back to original encoder size or RNN input size
+            self.fusion_projection = nn.Linear(fusion_input_size, encoder_output_size)
+            rnn_input_size = encoder_output_size # RNN takes projected features
+            logger.info(f"Using 'concat_proj' feature fusion (In: {fusion_input_size}, Out: {rnn_input_size})")
+        elif config.feature_fusion_method == "add":
+            # Features must have the same dimension for addition
+            rnn_input_size = encoder_output_size
+            self.fusion_projection = None # No projection needed for simple add
+            logger.info("Using 'add' feature fusion")
+        elif config.feature_fusion_method == "bilinear":
+            # Bilinear pooling (more complex, example placeholder)
+            # Output size might differ, e.g., might be encoder_output_size
+            self.fusion_bilinear = nn.Bilinear(encoder_output_size, encoder_output_size, encoder_output_size) # Example
+            rnn_input_size = encoder_output_size
+            self.fusion_projection = None
+            logger.info("Using 'bilinear' feature fusion (Example implementation)")
+        else: # Default to no fusion or just last layer
+            logger.warning(f"Unknown feature_fusion_method: {config.feature_fusion_method}. Using only last encoder layer.")
+            self.config.feature_fusion_method = "none"
+            self.fusion_projection = None
+            rnn_input_size = encoder_output_size # RNN takes last layer output
 
         # --- Intermediate Layers ---
-        encoder_output_size = self.vision_encoder.config.hidden_size
+        logger.info(f"Adding {config.intermediate_rnn_layers} RNN layers (Input Size: {rnn_input_size})...")
         self.rnn = nn.GRU(
             input_size=encoder_output_size,
             hidden_size=config.rnn_hidden_size,
@@ -170,41 +206,77 @@ class HierarchicalCtcOcrModel(PreTrainedModel):
                   if isinstance(layer, nn.Linear):
                       nn.init.xavier_uniform_(layer.weight)
                       if layer.bias is not None: nn.init.zeros_(layer.bias)
-
+        # *** Init Fusion Projection Layer ***
+        if hasattr(self, 'fusion_projection') and self.fusion_projection is not None:
+            nn.init.xavier_uniform_(self.fusion_projection.weight)
+            if self.fusion_projection.bias is not None: nn.init.zeros_(self.fusion_projection.bias)
+        # Init Bilinear if used
+        # if hasattr(self, 'fusion_bilinear'): ...
 
     def forward(
         self,
         pixel_values,
-        labels=None,       # Padded COMBINED char indices [B, MaxLabelLen]
-        label_lengths=None # Actual lengths of label sequences [B]
+        labels=None,
+        label_lengths=None
         ):
-        # 1. Vision Encoder
-        encoder_outputs = self.vision_encoder(pixel_values=pixel_values, return_dict=True)
-        hidden_states = encoder_outputs.last_hidden_state
+        # 1. Vision Encoder (Get Multiple Hidden States)
+        encoder_outputs = self.vision_encoder(
+            pixel_values=pixel_values,
+            output_hidden_states=True, # <<< Request hidden states
+            return_dict=True
+        )
+        all_hidden_states = encoder_outputs.hidden_states # Tuple of hidden states from embedding + each layer
 
-        # 2. RNN Layers
-        rnn_outputs, _ = self.rnn(hidden_states)
+        # 2. Select and Fuse Features
+        # Ensure indices are valid for the number of layers available
+        num_encoder_layers = len(all_hidden_states) - 1 # Exclude embedding output
+        valid_indices = []
+        for idx in self.config.vision_encoder_layer_indices:
+            actual_idx = idx if idx >= 0 else num_encoder_layers + 1 + idx # Handle negative indices
+            if 0 < actual_idx <= num_encoder_layers + 1 : # 0 is embedding, 1 to N are layers
+                 valid_indices.append(actual_idx)
+            else:
+                 logger.warning(f"Invalid encoder layer index {idx} ignored.")
 
-        # 3. Shared Feature Layer
-        shared_features = self.shared_layer(rnn_outputs) # [B, T, D_shared]
+        if len(valid_indices) < 1: # Need at least one layer
+             logger.warning("No valid encoder layers selected for fusion, using only last layer.")
+             features_to_fuse = [all_hidden_states[-1]] # Fallback to last layer
+        else:
+             features_to_fuse = [all_hidden_states[i] for i in valid_indices]
 
-        # 4. Base Character Branch
-        base_logits = self.base_classifier(shared_features) # [B, T, N_base]
 
-        # 5. Diacritic Character Branch (with Conditioning)
+        # Apply fusion method
+        if self.config.feature_fusion_method == "concat_proj" and len(features_to_fuse) > 1:
+            concatenated_features = torch.cat(features_to_fuse, dim=-1)
+            fused_features = self.fusion_projection(concatenated_features)
+        elif self.config.feature_fusion_method == "add" and len(features_to_fuse) > 1:
+            # Simple averaging or summing (ensure dimensions match)
+            fused_features = torch.stack(features_to_fuse, dim=0).mean(dim=0)
+        elif self.config.feature_fusion_method == "bilinear" and len(features_to_fuse) == 2:
+             # Example bilinear (requires exactly 2 features)
+             fused_features = self.fusion_bilinear(features_to_fuse[0], features_to_fuse[1])
+        else: # 'none' or fallback
+            fused_features = features_to_fuse[-1] # Use the last selected layer (usually the final encoder output)
+
+
+        # 3. RNN Layers (Input is now fused_features)
+        rnn_outputs, _ = self.rnn(fused_features) # [B, T_rnn, D_rnn*dirs]
+
+        # 4. Shared Feature Layer
+        shared_features = self.shared_layer(rnn_outputs)
+
+        # 5. Hierarchical Heads & Final Classifier (Same logic as before)
+        base_logits = self.base_classifier(shared_features)
         diacritic_input_features = shared_features
         if self.config.conditioning_method == 'concat':
             diacritic_input_features = torch.cat((shared_features, base_logits), dim=-1)
         elif self.config.conditioning_method == 'gate' and self.diacritic_gate is not None:
             gate_input = torch.cat((shared_features, base_logits), dim=-1)
             diacritic_gate_values = self.diacritic_gate(gate_input)
-            diacritic_input_features = shared_features * diacritic_gate_values # Gated features
-
-        diacritic_logits = self.diacritic_classifier(diacritic_input_features) # [B, T, N_diac]
-
-        # 6. Final Combined Classifier
-        final_input_features = shared_features # Using simplest option
-        final_logits = self.final_classifier(final_input_features) # [B, T, N_combined]
+            diacritic_input_features = shared_features * diacritic_gate_values
+        diacritic_logits = self.diacritic_classifier(diacritic_input_features)
+        final_input_features = shared_features
+        final_logits = self.final_classifier(final_input_features)
 
         # --- Prepare for CTC Loss ---
         log_probs = final_logits.log_softmax(dim=2).permute(1, 0, 2) # [T, B, N_combined]
@@ -247,7 +319,8 @@ class HierarchicalCtcOcrModel(PreTrainedModel):
         self.config.base_char_vocab_size = len(getattr(self, 'base_char_vocab', []))
         self.config.diacritic_vocab_size = len(getattr(self, 'diacritic_vocab', []))
         self.config.combined_char_vocab_size = len(getattr(self, 'combined_char_vocab', []))
-
+        if hasattr(self.vision_encoder, 'config'): self.config.vision_encoder_config = self.vision_encoder.config
+        
         # Save the config
         self.config.save_pretrained(save_directory)
 
@@ -268,58 +341,34 @@ class HierarchicalCtcOcrModel(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, config=None, **kwargs):
-        """Loads the model configuration and state dictionary."""
+
         logger.info(f"Loading {cls.__name__} from: {pretrained_model_name_or_path}")
         config_path = os.path.join(pretrained_model_name_or_path, "config.json")
         loaded_config = None
 
-        # 1. Determine Config (Prioritize passed config -> file -> kwargs)
-        if config is not None and isinstance(config, cls.config_class):
-            logger.info("Using provided config object.")
-            loaded_config = config
-        elif os.path.exists(config_path):
-            logger.info(f"Loading config from file: {config_path}")
-            # Load config using its own from_pretrained method
-            loaded_config = cls.config_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
-            # Override vocabs from kwargs if they were explicitly passed
-            if 'base_char_vocab' in kwargs and kwargs['base_char_vocab']: loaded_config.base_char_vocab = kwargs['base_char_vocab']; loaded_config.base_char_vocab_size = len(kwargs['base_char_vocab'])
-            if 'diacritic_vocab' in kwargs and kwargs['diacritic_vocab']: loaded_config.diacritic_vocab = kwargs['diacritic_vocab']; loaded_config.diacritic_vocab_size = len(kwargs['diacritic_vocab'])
-            if 'combined_char_vocab' in kwargs and kwargs['combined_char_vocab']: loaded_config.combined_char_vocab = kwargs['combined_char_vocab']; loaded_config.combined_char_vocab_size = len(kwargs['combined_char_vocab'])
-        else:
-            logger.warning(f"Config file not found at {config_path}. Initializing new config from kwargs.")
-            # Need all vocabs in kwargs if creating config from scratch
-            if not all(k in kwargs for k in ['base_char_vocab', 'diacritic_vocab', 'combined_char_vocab']):
-                 raise ValueError("All vocabs (base, diacritic, combined) must be in kwargs when initializing without config.json.")
-            # Set vision encoder name if missing in kwargs
-            if 'vision_encoder_name' not in kwargs and hasattr(cls.config_class, '__init__'):
-                 sig = inspect.signature(cls.config_class.__init__)
-                 if 'vision_encoder_name' in sig.parameters: kwargs['vision_encoder_name'] = sig.parameters['vision_encoder_name'].default
+        if config is not None and isinstance(config, cls.config_class): loaded_config = config; logger.info("Using provided config object.")
+        elif os.path.exists(config_path): loaded_config = cls.config_class.from_pretrained(pretrained_model_name_or_path, **kwargs); logger.info(f"Loading config from file: {config_path}")
+        else: # Initialize new config from kwargs
+            logger.warning(f"Config file not found at {config_path}. Initializing new config.")
+            if not all(k in kwargs for k in ['base_char_vocab', 'diacritic_vocab', 'combined_char_vocab']): raise ValueError("All vocabs required in kwargs w/o config.json.")
+            if 'vision_encoder_name' not in kwargs: kwargs['vision_encoder_name'] = cls.config_class().vision_encoder_name # Get default vision name
             loaded_config = cls.config_class(**kwargs)
 
-        # 2. Instantiate Model using the determined config
-        model = cls(loaded_config)
+        # Override vocabs from kwargs if provided AFTER loading/creating config
+        if 'base_char_vocab' in kwargs and kwargs['base_char_vocab']: loaded_config.base_char_vocab = kwargs['base_char_vocab']; loaded_config.base_char_vocab_size = len(kwargs['base_char_vocab'])
+        if 'diacritic_vocab' in kwargs and kwargs['diacritic_vocab']: loaded_config.diacritic_vocab = kwargs['diacritic_vocab']; loaded_config.diacritic_vocab_size = len(kwargs['diacritic_vocab'])
+        if 'combined_char_vocab' in kwargs and kwargs['combined_char_vocab']: loaded_config.combined_char_vocab = kwargs['combined_char_vocab']; loaded_config.combined_char_vocab_size = len(kwargs['combined_char_vocab'])
 
-        # 3. Load State Dictionary
+        model = cls(loaded_config) # Instantiate with final config
+
+        # Load state dict
         state_dict_path = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
-        is_loading_base_model = not os.path.exists(config_path) # True if we loaded from e.g., 'microsoft/trocr...'
-
+        is_loading_base_model = not os.path.exists(config_path)
         if os.path.exists(state_dict_path) and not is_loading_base_model:
-            logger.info(f"Loading state dict from: {state_dict_path}")
-            try:
-                 state_dict = torch.load(state_dict_path, map_location="cpu")
-                 load_result = model.load_state_dict(state_dict, strict=False) # Allow missing/unexpected keys
-                 logger.info(f"Loaded model state. Missing: {load_result.missing_keys}, Unexpected: {load_result.unexpected_keys}")
-            except Exception as e:
-                 logger.error(f"Error loading state dict from {state_dict_path}: {e}", exc_info=True)
-                 logger.warning("Model weights might be only partially loaded or default initialized.")
-        elif is_loading_base_model:
-             logger.info(f"Loading base vision encoder weights only. Other layers (RNN, Heads) are randomly initialized.")
-        else: # State dict path doesn't exist, and not loading base model
-             logger.warning(f"State dict file '{state_dict_path}' not found. Model is using base encoder + random layers.")
+            try: state_dict = torch.load(state_dict_path, map_location="cpu"); load_result = model.load_state_dict(state_dict, strict=False); logger.info(f"Loaded state. Miss:{load_result.missing_keys}, Unexp:{load_result.unexpected_keys}")
+            except Exception as e: logger.error(f"Error loading state dict: {e}")
+        elif is_loading_base_model: logger.info(f"Loading base weights only.")
+        else: logger.warning(f"State dict not found. Using base + random.")
 
-        # 4. Ensure model instance has vocabs (copy from config)
-        model.base_char_vocab = loaded_config.base_char_vocab
-        model.diacritic_vocab = loaded_config.diacritic_vocab
-        model.combined_char_vocab = loaded_config.combined_char_vocab
-
+        model.base_char_vocab = loaded_config.base_char_vocab; model.diacritic_vocab = loaded_config.diacritic_vocab; model.combined_char_vocab = loaded_config.combined_char_vocab
         return model

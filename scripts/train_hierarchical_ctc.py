@@ -11,10 +11,7 @@ import json
 import numpy as np
 
 # --- Adjust imports ---
-from model.hierarchical_ctc_model import (
-    HierarchicalCtcOcrModel,
-    HierarchicalCtcOcrConfig,
-)  # Use the NEW model
+from model.hierarchical_ctc_model import HierarchicalCtcMultiScaleOcrModel, HierarchicalCtcOcrConfig
 from data.ctc_ocr_dataset import CtcOcrDataset  # Reuse standard CTC dataset
 from data.ctc_collation import ctc_collate_fn  # Reuse standard CTC collate
 from training.ctc_trainer import train_ctc_model  # Reuse standard CTC trainer
@@ -31,7 +28,7 @@ logging.basicConfig(
         logging.FileHandler('main_training_hierarchical.log'),
     ],
 )
-logger = logging.getLogger('TrainHierarchicalCtcScript')
+logger = logging.getLogger('TrainHierarchicalCtcMultiScaleScript')
 
 # --- Define Base/Diacritic Vocabs (Needed for model config, even if not used in loss) ---
 # These should ideally match the ones used in dual_ctc for consistency if comparing
@@ -196,7 +193,8 @@ def main():
 
     parser.add_argument('--resume_from_checkpoint', type=str, default=None)
     parser.add_argument('--load_weights_from', type=str, default=None)
-
+    parser.add_argument('--fusion_layers', type=str, default="-1,-4", help='Comma-separated list of negative/positive vision encoder layer indices to fuse (e.g., "-1,-4").')
+    parser.add_argument('--fusion_method', type=str, default="concat_proj", choices=['concat_proj', 'add', 'bilinear', 'none'], help='Method to fuse features from different layers.')
     # Training parameters
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=16)
@@ -250,8 +248,14 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f'Using device: {device}')
-    run_name_to_use = args.wandb_run_name or os.path.basename(args.output_dir) or 'hier_ctc_run'
-
+    run_name_to_use = args.wandb_run_name or os.path.basename(args.output_dir) or "hier_ctc_multiscale_run" 
+    # --- Parse Fusion Layers ---
+    try:
+        fusion_layer_indices = [int(x.strip()) for x in args.fusion_layers.split(',')]
+        logger.info(f"Using fusion layers: {fusion_layer_indices}")
+    except:
+        logger.error(f"Invalid format for --fusion_layers '{args.fusion_layers}'. Using default [-1, -4].")
+        fusion_layer_indices = [-1, -4]
     # --- Build COMBINED Character Vocabulary for final CTC output ---
     if args.combined_char_vocab_json and os.path.exists(args.combined_char_vocab_json):
         logger.info(f'Loading COMBINED char vocab from: {args.combined_char_vocab_json}')
@@ -281,7 +285,6 @@ def main():
         logger.info(f'Saved generated COMBINED vocab to {vocab_save_path}')
 
     # --- Load Dataset ---
-    # (Same as single CTC)
     try:
         logger.info(f'Loading dataset: {args.dataset_name}')
         hf_dataset = load_dataset(args.dataset_name)
@@ -304,12 +307,16 @@ def main():
 
     # --- Initialize Model ---
     try:
-        logger.info('Initializing HierarchicalCtcOcrModel configuration...')
-        model_config = HierarchicalCtcOcrConfig(
+        logger.info("Initializing HierarchicalCtcMultiScaleOcrModel configuration...")
+        model_config = HierarchicalCtcOcrConfig( # Use the same config class name
             vision_encoder_name=args.vision_encoder,
-            base_char_vocab=BASE_CHAR_VOCAB_HIER,  # Pass base/diac vocabs for head sizes
+            base_char_vocab=BASE_CHAR_VOCAB_HIER,
             diacritic_vocab=DIACRITIC_VOCAB_HIER,
-            combined_char_vocab=combined_vocab,  # Pass COMBINED vocab for final head
+            combined_char_vocab=combined_vocab,
+            # *** Pass fusion args ***
+            vision_encoder_layer_indices=fusion_layer_indices,
+            feature_fusion_method=args.fusion_method,
+            # *** End fusion args ***
             intermediate_rnn_layers=args.rnn_layers,
             rnn_hidden_size=args.rnn_hidden_size,
             rnn_dropout=args.rnn_dropout,
@@ -317,19 +324,17 @@ def main():
             shared_hidden_size=args.shared_hidden_size,
             conditioning_method=args.conditioning_method,
             classifier_dropout=args.classifier_dropout,
-            blank_idx=combined_char_to_idx['<blank>'],  # Use blank idx from combined vocab
+            blank_idx=combined_char_to_idx['<blank>']
         )
 
         model_load_path = args.load_weights_from if args.load_weights_from else args.vision_encoder
-        logger.info(f'Instantiating/Loading HierarchicalCtcOcrModel from: {model_load_path}')
-        init_kwargs = model_config.to_dict()  # Pass config dict
-        model = HierarchicalCtcOcrModel.from_pretrained(model_load_path, **init_kwargs)
+        logger.info(f"Instantiating/Loading model from: {model_load_path}")
+        init_kwargs = model_config.to_dict()
+        model = HierarchicalCtcMultiScaleOcrModel.from_pretrained(model_load_path, **init_kwargs) # Use NEW model class name
         processor = model.processor
-        logger.info('Hierarchical CTC Model and Processor initialized.')
+        logger.info("Model and Processor initialized.")
 
-    except Exception as model_init_e:
-        logger.error(f'FATAL: Model init failed: {model_init_e}', exc_info=True)
-        return 1
+    except Exception as model_init_e: logger.error(f"FATAL: Model init failed: {model_init_e}", exc_info=True); return 1
 
     # --- Create Datasets ---
     try:
