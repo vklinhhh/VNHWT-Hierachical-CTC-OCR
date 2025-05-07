@@ -198,7 +198,7 @@ def main():
     # Training parameters
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--learning_rate', type=float, default=7e-8)
     parser.add_argument('--val_split', type=float, default=0.1)
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--warmup_ratio', type=float, default=0.1)
@@ -222,23 +222,26 @@ def main():
     parser.add_argument(
         '--conditioning_method',
         type=str,
-        default='concat',
-        choices=['concat', 'gate', 'none'],
+        default='concat_proj',
+        choices=['concat_proj', 'gate', 'none'],
         help='Method to condition diacritic head.',
     )
-    parser.add_argument('--classifier_dropout', type=float, default=0.1)
+    parser.add_argument('--classifier_dropout', type=float, default=0.2)
 
     # Logging, System params
     parser.add_argument('--wandb_project', type=str, default=None)
     parser.add_argument('--wandb_run_name', type=str, default=None)
-    parser.add_argument('--log_interval', type=int, default=50)
+    parser.add_argument('--log_interval', type=int, default=5000)
     parser.add_argument('--eval_steps', type=int, default=None)
     parser.add_argument('--use_amp', action='store_true')
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=16)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--discriminative_lr', action='store_true')
+    parser.add_argument('--skip_final_eval', action='store_true')
+    parser.add_argument('--num_shared_layers', type=int, default=2)
     parser.add_argument('--encoder_lr_factor', type=float, default=0.1)
-
+    parser.add_argument('--reset_scheduler_on_resume', action='store_true',
+                        help="Reinitialize the LR scheduler when resuming training (useful if extending total epochs).")
     args = parser.parse_args()
 
     # --- Setup ---
@@ -324,7 +327,8 @@ def main():
             shared_hidden_size=args.shared_hidden_size,
             conditioning_method=args.conditioning_method,
             classifier_dropout=args.classifier_dropout,
-            blank_idx=combined_char_to_idx['<blank>']
+            blank_idx=combined_char_to_idx['<blank>'],
+            num_shared_layers=args.num_shared_layers,
         )
 
         model_load_path = args.load_weights_from if args.load_weights_from else args.vision_encoder
@@ -353,8 +357,6 @@ def main():
     # --- Move model to device ---
     model.to(device)
     logger.info(f'Model on device: {device}')
-    # --- Create Optimizer and Scheduler ---
-    # ... (same as CTC) ...
     try:
         optimizer = create_optimizer(
             model,  
@@ -405,9 +407,24 @@ def main():
             else: logger.warning("Optimizer state missing.")
 
             if load_optimizer_etc and lr_scheduler and 'lr_scheduler_state_dict' in checkpoint:
-                lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
-                logger.info("Scheduler loaded.")
-
+                if args.reset_scheduler_on_resume:
+                    logger.warning("Resetting LR scheduler state due to --reset_scheduler_on_resume flag.")    
+                    num_training_batches_new = math.ceil(len(train_dataset) / args.batch_size) # Needs train_dataset to be defined
+                    total_steps_new = math.ceil(num_training_batches_new / args.grad_accumulation) * args.epochs # Use NEW args.epochs
+                    warmup_steps_new = int(total_steps_new * args.warmup_ratio)
+                    # Create a NEW scheduler instance
+                    optimizer = create_optimizer(
+                                model,  
+                                args.learning_rate,
+                                args.weight_decay,
+                                args.discriminative_lr,
+                                args.encoder_lr_factor,
+                            )
+                    lr_scheduler = CosineWarmupScheduler(optimizer, warmup_steps_new, total_steps_new, last_epoch=start_epoch-1) # Start from current epoch
+                    logger.info(f"Reinitialized LR scheduler for {args.epochs} total epochs. Current epoch: {start_epoch}")
+                else:
+                    lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+                    logger.info("Scheduler state loaded from checkpoint.")
             # *** ALWAYS try to load scaler state if found ***
             if load_optimizer_etc and args.use_amp and 'scaler_state_dict' in checkpoint:
                 scaler_state_to_load = checkpoint['scaler_state_dict'] # Assign state

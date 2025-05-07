@@ -36,9 +36,10 @@ class HierarchicalCtcOcrConfig(PretrainedConfig):
         rnn_bidirectional=True,
         # Shared / Hierarchical Layers
         shared_hidden_size=512, # Dimension after RNN, before branching
-        conditioning_method="concat", # 'concat', 'gate', 'none'
+        num_shared_layers=2, 
+        conditioning_method="concat_proj", # 'concat_proj', 'gate', 'none'
         # Classifier dropout
-        classifier_dropout=0.1,
+        classifier_dropout=0.2,
         blank_idx=0, # For final combined vocab
         # Vision encoder config can be stored if needed (optional)
         vision_encoder_config=None,
@@ -66,6 +67,7 @@ class HierarchicalCtcOcrConfig(PretrainedConfig):
         self.rnn_dropout = rnn_dropout
         self.rnn_bidirectional = rnn_bidirectional
         self.shared_hidden_size = shared_hidden_size
+        self.num_shared_layers = num_shared_layers 
         self.conditioning_method = conditioning_method
         self.classifier_dropout = classifier_dropout
         self.blank_idx = blank_idx
@@ -89,7 +91,7 @@ class HierarchicalCtcMultiScaleOcrModel(PreTrainedModel):
         if not config.combined_char_vocab:
             raise ValueError("Combined character vocabulary must be provided in the config during model initialization.")
         if config.conditioning_method != 'none' and (not config.base_char_vocab or not config.diacritic_vocab):
-             raise ValueError("Base/Diacritic vocabs must be provided in config for conditioning methods 'concat' or 'gate'.")
+             raise ValueError("Base/Diacritic vocabs must be provided in config for conditioning methods 'concat_proj' or 'gate'.")
 
         # Store vocabs directly on model instance for easy access later
         self.base_char_vocab = config.base_char_vocab
@@ -151,33 +153,72 @@ class HierarchicalCtcMultiScaleOcrModel(PreTrainedModel):
         )
         rnn_output_size = config.rnn_hidden_size * 2 if config.rnn_bidirectional else config.rnn_hidden_size
 
-        self.shared_layer = nn.Sequential(
-             nn.Linear(rnn_output_size, config.shared_hidden_size),
-             nn.LayerNorm(config.shared_hidden_size),
-             nn.GELU(),
-             nn.Dropout(config.classifier_dropout)
+        # --- Deeper Shared Feature Layer ---
+        shared_layers = []
+        current_shared_size = rnn_output_size
+        for i in range(config.num_shared_layers):
+            shared_layers.extend(
+                [
+                    nn.Linear(current_shared_size, config.shared_hidden_size),
+                    nn.LayerNorm(config.shared_hidden_size),
+                    nn.GELU(),
+                    nn.Dropout(config.classifier_dropout),
+                ]
+            )
+            current_shared_size = (
+                config.shared_hidden_size
+            )  # Subsequent layers use shared_hidden_size
+        self.shared_layer = nn.Sequential(*shared_layers)
+        logger.info(
+            f'Added {config.num_shared_layers} shared feature layer(s) (Final Output: {config.shared_hidden_size})'
         )
-        logger.info(f"Added shared feature layer (Output: {config.shared_hidden_size})")
 
         # --- Hierarchical Branching ---
         self.base_classifier = nn.Linear(config.shared_hidden_size, config.base_char_vocab_size)
         logger.info(f"Added Base Classifier Head (Output: {config.base_char_vocab_size})")
-
+        
+        # --- Conditioning Logic & Diacritic Head ---
         conditioning_input_size = config.shared_hidden_size
-        self.diacritic_gate = None # Initialize gate to None
-        if config.conditioning_method == 'concat':
-            conditioning_input_size += config.base_char_vocab_size # Shared + Base Logits
-            logger.info("Using 'concat' conditioning for diacritic head.")
+        self.diacritic_gate = None
+        self.diacritic_condition_proj = None  # Initialize projection layer
+
+        if config.conditioning_method == 'concat_proj':  # Renamed 'concat' to 'concat_proj'
+            concat_size = (
+                config.shared_hidden_size + config.base_char_vocab_size
+            )  # Shared feats + Base Logits
+            # Add projection layer
+            self.diacritic_condition_proj = nn.Sequential(
+                nn.Linear(concat_size, config.shared_hidden_size),  # Project back down
+                nn.LayerNorm(config.shared_hidden_size),
+                nn.GELU(),
+                nn.Dropout(config.classifier_dropout),
+            )
+            diacritic_head_input_size = config.shared_hidden_size  # Head takes projected features
+            logger.info("Using 'concat_proj' conditioning for diacritic head.")
         elif config.conditioning_method == 'gate':
             self.diacritic_gate = nn.Sequential(
                 nn.Linear(config.shared_hidden_size + config.base_char_vocab_size, config.shared_hidden_size),
                 nn.Sigmoid()
             )
+            diacritic_head_input_size = config.shared_hidden_size  # Head takes gated features
             logger.info("Using 'gate' conditioning for diacritic head.")
-            # Input size remains shared_hidden_size, applied via multiplication
+        else:  # 'none' or unknown
+            if config.conditioning_method != 'none':
+                logger.warning(
+                    f"Unknown conditioning method '{config.conditioning_method}'. Defaulting to 'none'."
+                )
+                self.config.conditioning_method = 'none'
+            diacritic_head_input_size = (
+                config.shared_hidden_size
+            )  # Head takes shared features directly
+            logger.info("Using 'none' conditioning for diacritic head.")
 
-        self.diacritic_classifier = nn.Linear(conditioning_input_size, config.diacritic_vocab_size)
-        logger.info(f"Added Diacritic Classifier Head (Input: {conditioning_input_size}, Output: {config.diacritic_vocab_size})")
+        self.diacritic_classifier = nn.Linear(
+            diacritic_head_input_size, config.diacritic_vocab_size
+        )
+        logger.info(
+            f'Added Diacritic Classifier Head (Input: {diacritic_head_input_size}, Output: {config.diacritic_vocab_size})'
+        )
 
         # --- Final Combined Classifier ---
         final_combiner_input_size = config.shared_hidden_size
@@ -210,8 +251,12 @@ class HierarchicalCtcMultiScaleOcrModel(PreTrainedModel):
         if hasattr(self, 'fusion_projection') and self.fusion_projection is not None:
             nn.init.xavier_uniform_(self.fusion_projection.weight)
             if self.fusion_projection.bias is not None: nn.init.zeros_(self.fusion_projection.bias)
-        # Init Bilinear if used
-        # if hasattr(self, 'fusion_bilinear'): ...
+        # Projection Layer
+        if self.diacritic_condition_proj:
+            for layer in self.diacritic_condition_proj:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    nn.init.zeros_(layer.bias)
 
     def forward(
         self,
@@ -263,18 +308,28 @@ class HierarchicalCtcMultiScaleOcrModel(PreTrainedModel):
         rnn_outputs, _ = self.rnn(fused_features) # [B, T_rnn, D_rnn*dirs]
 
         # 4. Shared Feature Layer
-        shared_features = self.shared_layer(rnn_outputs)
+        shared_features = self.shared_layer(rnn_outputs)  # [B, T, D_shared]
 
         # 5. Hierarchical Heads & Final Classifier (Same logic as before)
-        base_logits = self.base_classifier(shared_features)
-        diacritic_input_features = shared_features
-        if self.config.conditioning_method == 'concat':
-            diacritic_input_features = torch.cat((shared_features, base_logits), dim=-1)
+        base_logits = self.base_classifier(shared_features) # [B, T, N_base]
+        
+        if self.config.conditioning_method == 'concat_proj':
+            # Concatenate then project
+            concat_features = torch.cat((shared_features, base_logits), dim=-1)
+            diacritic_input_features = self.diacritic_condition_proj(
+                concat_features
+            )  # Use projected
         elif self.config.conditioning_method == 'gate' and self.diacritic_gate is not None:
+            # Gate the shared features
             gate_input = torch.cat((shared_features, base_logits), dim=-1)
             diacritic_gate_values = self.diacritic_gate(gate_input)
-            diacritic_input_features = shared_features * diacritic_gate_values
-        diacritic_logits = self.diacritic_classifier(diacritic_input_features)
+            diacritic_input_features = shared_features * diacritic_gate_values  # Apply gate
+        else:  # 'none'
+            diacritic_input_features = shared_features  # Use shared directly
+
+        diacritic_logits = self.diacritic_classifier(diacritic_input_features)  # [B, T, N_diac]
+
+        # 6. Final Combined Classifier
         final_input_features = shared_features
         final_logits = self.final_classifier(final_input_features)
 
