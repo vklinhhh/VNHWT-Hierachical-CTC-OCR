@@ -173,6 +173,7 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+demo_outputs/
 outputs/
 logs/
 wandb/

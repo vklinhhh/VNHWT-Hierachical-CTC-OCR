@@ -13,6 +13,13 @@ import json
 import logging
 import inspect # For checking kwargs in from_pretrained fallback
 
+# Import the new diacritic attention modules
+from .diacritic_attention import (
+    VisualDiacriticAttention,
+    CharacterDiacriticCompatibility,
+    FewShotDiacriticAdapter
+)
+
 logger = logging.getLogger(__name__)
 
 # --- Configuration Class ---
@@ -43,6 +50,11 @@ class HierarchicalCtcOcrConfig(PretrainedConfig):
         blank_idx=0, # For final combined vocab
         # Vision encoder config can be stored if needed (optional)
         vision_encoder_config=None,
+        # New configuration parameters for diacritic attention
+        use_visual_diacritic_attention=False,
+        use_character_diacritic_compatibility=False,
+        use_few_shot_diacritic_adapter=False,
+        num_few_shot_prototypes=5,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -72,6 +84,12 @@ class HierarchicalCtcOcrConfig(PretrainedConfig):
         self.classifier_dropout = classifier_dropout
         self.blank_idx = blank_idx
         self.vision_encoder_config = vision_encoder_config # Store this too
+
+        # Store new configuration parameters
+        self.use_visual_diacritic_attention = use_visual_diacritic_attention
+        self.use_character_diacritic_compatibility = use_character_diacritic_compatibility
+        self.use_few_shot_diacritic_adapter = use_few_shot_diacritic_adapter
+        self.num_few_shot_prototypes = num_few_shot_prototypes
 
         if not self.combined_char_vocab:
             # Allow init without combined if loading base, but log warning
@@ -114,9 +132,27 @@ class HierarchicalCtcMultiScaleOcrModel(PreTrainedModel):
             logger.error(f"Failed loading base components: {e}", exc_info=True); raise
             
         # --- Feature Fusion Layer ---
-        encoder_output_size = self.config.vision_encoder_config.hidden_size
+        # Handle different forms of vision_encoder_config (could be dict or object)
+        if self.config.vision_encoder_config is None:
+            # Fallback to a default size if no config is available
+            encoder_output_size = 768
+            logger.warning(f"No vision encoder config available. Using default output size: {encoder_output_size}")
+        elif isinstance(self.config.vision_encoder_config, dict):
+            # Handle dict configuration
+            encoder_output_size = self.config.vision_encoder_config.get('hidden_size', 768)
+            logger.info(f"Using hidden size from config dict: {encoder_output_size}")
+        else:
+            # Handle object configuration
+            try:
+                encoder_output_size = self.config.vision_encoder_config.hidden_size
+                logger.info(f"Using hidden size from config object: {encoder_output_size}")
+            except AttributeError:
+                # Fallback if the attribute doesn't exist
+                encoder_output_size = 768
+                logger.warning(f"Could not get hidden size from config. Using default: {encoder_output_size}")
+
         num_fusion_layers = len(config.vision_encoder_layer_indices)
-        fusion_input_size = encoder_output_size * num_fusion_layers # Default for concat
+        fusion_input_size = encoder_output_size * num_fusion_layers  # Default for concat
 
         if config.feature_fusion_method == "concat_proj":
             # Project concatenated features back to original encoder size or RNN input size
@@ -213,6 +249,38 @@ class HierarchicalCtcMultiScaleOcrModel(PreTrainedModel):
             )  # Head takes shared features directly
             logger.info("Using 'none' conditioning for diacritic head.")
 
+        # --- NEW: Enhanced Diacritic Classification ---
+        self.visual_diacritic_attention = None
+        self.character_diacritic_compatibility = None
+        self.few_shot_diacritic_adapter = None
+        
+        # Initialize the components based on configuration
+        if config.use_visual_diacritic_attention:
+            self.visual_diacritic_attention = VisualDiacriticAttention(
+                feature_dim=diacritic_head_input_size,
+                diacritic_vocab_size=config.diacritic_vocab_size
+            )
+            logger.info("Initialized Visual Diacritic Attention module")
+        
+        if config.use_character_diacritic_compatibility:
+            self.character_diacritic_compatibility = CharacterDiacriticCompatibility(
+                base_vocab_size=config.base_char_vocab_size,
+                diacritic_vocab_size=config.diacritic_vocab_size,
+                shared_dim=config.shared_hidden_size if config.conditioning_method != 'none' else None,
+                base_char_vocab=self.base_char_vocab,  # Pass the actual vocabulary lists
+                diacritic_vocab=self.diacritic_vocab
+            )
+            logger.info("Initialized Character-Diacritic Compatibility module")
+        
+        if config.use_few_shot_diacritic_adapter:
+            self.few_shot_diacritic_adapter = FewShotDiacriticAdapter(
+                feature_dim=diacritic_head_input_size,
+                diacritic_vocab_size=config.diacritic_vocab_size,
+                num_prototypes=config.num_few_shot_prototypes
+            )
+            logger.info(f"Initialized Few-Shot Diacritic Adapter with {config.num_few_shot_prototypes} prototypes")
+        
+        # Always create the standard diacritic classifier as a fallback or to combine with enhanced approaches
         self.diacritic_classifier = nn.Linear(
             diacritic_head_input_size, config.diacritic_vocab_size
         )
@@ -327,7 +395,44 @@ class HierarchicalCtcMultiScaleOcrModel(PreTrainedModel):
         else:  # 'none'
             diacritic_input_features = shared_features  # Use shared directly
 
-        diacritic_logits = self.diacritic_classifier(diacritic_input_features)  # [B, T, N_diac]
+        # --- NEW: Enhanced Diacritic Classification Logic ---
+        # 1. Start with the standard classifier
+        standard_diacritic_logits = self.diacritic_classifier(diacritic_input_features)  # [B, T, N_diac]
+        
+        # 2. Apply Visual Diacritic Attention if enabled
+        visual_logits = None
+        if self.visual_diacritic_attention is not None:
+            visual_logits = self.visual_diacritic_attention(diacritic_input_features)
+        
+        # 3. Apply Character-Diacritic Compatibility if enabled
+        compatibility_bias = None
+        if self.character_diacritic_compatibility is not None:
+            compatibility_bias = self.character_diacritic_compatibility(
+                base_logits, 
+                shared_features if self.config.conditioning_method != 'none' else None
+            )
+        
+        # 4. Apply Few-Shot Diacritic Adapter if enabled
+        few_shot_logits = None
+        if self.few_shot_diacritic_adapter is not None:
+            few_shot_logits = self.few_shot_diacritic_adapter(diacritic_input_features)
+        
+        # 5. Combine all diacritic prediction approaches
+        diacritic_logits = standard_diacritic_logits
+        
+        # Add visual attention logits if available
+        if visual_logits is not None:
+            diacritic_logits = diacritic_logits + visual_logits
+        
+        # Add compatibility bias if available
+        if compatibility_bias is not None:
+            diacritic_logits = diacritic_logits + compatibility_bias
+        
+        # Add few-shot logits if available
+        if few_shot_logits is not None:
+            diacritic_logits = diacritic_logits + few_shot_logits
+        
+        # --- End of Enhanced Diacritic Classification ---
 
         # 6. Final Combined Classifier
         final_input_features = shared_features

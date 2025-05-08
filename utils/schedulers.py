@@ -69,3 +69,93 @@ class CosineWarmupScheduler(_LRScheduler):
         self.max_steps = state_dict.pop('max_steps')
         self.eta_min = state_dict.pop('eta_min')
         super().load_state_dict(state_dict)
+
+
+class CosineWarmupWithPlateauScheduler(object):
+    """
+    Combined scheduler that uses cosine warmup followed by ReduceLROnPlateau.
+    This scheduler starts with a warmup period and cosine decay, then switches
+    to ReduceLROnPlateau mode after a specified number of steps.
+    """
+    def __init__(self, optimizer, warmup_steps, max_steps, plateau_patience=5,
+                 plateau_factor=0.5, plateau_min_lr=1e-6, plateau_metric='val_cer',
+                 plateau_mode='min', verbose=True):
+        """
+        Args:
+            optimizer (Optimizer): Wrapped optimizer.
+            warmup_steps (int): Number of linear warm-up steps.
+            max_steps (int): Number of steps for initial cosine schedule.
+            plateau_patience (int): Number of epochs with no improvement after which LR will be reduced.
+            plateau_factor (float): Factor by which LR will be reduced.
+            plateau_min_lr (float): Minimum LR value.
+            plateau_metric (str): Metric to monitor for plateau scheduling.
+            plateau_mode (str): 'min' or 'max' depending on whether lower or higher metric is better.
+            verbose (bool): If True, prints a message for each LR update.
+        """
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self.plateau_metric = plateau_metric
+        self.cosine_scheduler = CosineWarmupScheduler(
+            optimizer, warmup_steps, max_steps
+        )
+        self.plateau_scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode=plateau_mode,
+            factor=plateau_factor,
+            patience=plateau_patience,
+            min_lr=plateau_min_lr,
+            verbose=verbose
+        )
+        self.current_step = 0
+        self.using_plateau = False
+        
+        logger.info(f"CosineWarmupWithPlateauScheduler initialized: "
+                   f"warmup={warmup_steps}, max_steps={max_steps}, "
+                   f"plateau_patience={plateau_patience}, plateau_factor={plateau_factor}, "
+                   f"plateau_metric={plateau_metric}")
+    
+    def step(self, metric=None):
+        """
+        Step function that updates learning rate.
+        During warmup/cosine phase, use step count.
+        After that, use validation metric for plateau scheduling.
+        
+        Args:
+            metric (float, optional): Validation metric value. Required for plateau phase.
+        """
+        if self.current_step < self.max_steps:
+            # Still in cosine phase
+            self.cosine_scheduler.step()
+            self.current_step += 1
+            return
+        
+        # Switch to plateau mode if not already
+        if not self.using_plateau:
+            logger.info(f"Switching to ReduceLROnPlateau scheduler after {self.current_step} steps.")
+            self.using_plateau = True
+        
+        # In plateau phase, require metric
+        if metric is None:
+            logger.warning(f"Metric value required for ReduceLROnPlateau but none provided. Skipping step.")
+            return
+        
+        # Update plateau scheduler
+        self.plateau_scheduler.step(metric)
+        self.current_step += 1
+    
+    def state_dict(self):
+        """Returns the state of the scheduler as a dict."""
+        return {
+            'cosine_state': self.cosine_scheduler.state_dict(),
+            'plateau_state': self.plateau_scheduler.state_dict(),
+            'current_step': self.current_step,
+            'using_plateau': self.using_plateau
+        }
+    
+    def load_state_dict(self, state_dict):
+        """Loads the scheduler state."""
+        self.cosine_scheduler.load_state_dict(state_dict['cosine_state'])
+        self.plateau_scheduler.load_state_dict(state_dict['plateau_state'])
+        self.current_step = state_dict['current_step']
+        self.using_plateau = state_dict['using_plateau']

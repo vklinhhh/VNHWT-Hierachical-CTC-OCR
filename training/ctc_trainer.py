@@ -17,6 +17,7 @@ from .ctc_validation import compute_ctc_validation_metrics
 # Use the standard CTC collate function as the dataset provides combined char labels
 from data.ctc_collation import ctc_collate_fn
 from utils.ctc_utils import CTCDecoder # For potential decoding during logging/eval
+from utils.schedulers import CosineWarmupWithPlateauScheduler  # Import the combined scheduler
 
 # Set up logging
 logger = logging.getLogger('CtcTrainer') # Keep original logger name or change if preferred
@@ -86,7 +87,7 @@ def train_ctc_model(
     """
     Training function for CTC-based OCR models (single or hierarchical head).
     Uses standard CTC loss on the model's final 'logits' output.
-    *** Includes more defensive GradScaler handling for resuming. ***
+    *** Updated to support ReduceLROnPlateau scheduler. ***
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -95,6 +96,11 @@ def train_ctc_model(
     # --- Determine if higher value is better for metric ---
     higher_is_better = best_metric_name not in ['val_loss', 'val_cer', 'val_wer']
 
+    # --- Identify which scheduler type we're using ---
+    is_plateau_scheduler = isinstance(lr_scheduler, CosineWarmupWithPlateauScheduler)
+    if is_plateau_scheduler:
+        logger.info("Using CosineWarmupWithPlateauScheduler - will update based on validation metrics")
+    
     # --- Setup Output Dirs & WandB ---
     checkpoints_dir = os.path.join(output_dir, "checkpoints")
     os.makedirs(checkpoints_dir, exist_ok=True)
@@ -299,7 +305,8 @@ def train_ctc_model(
                         optimizer.zero_grad(set_to_none=True)
 
                         # LR Scheduler Step (AFTER optimizer step)
-                        if lr_scheduler is not None:
+                        # Only step non-plateau schedulers here - plateau scheduler will be updated after validation
+                        if lr_scheduler is not None and not is_plateau_scheduler:
                             lr_scheduler.step()
                         # --- End Defensive Scaler Handling ---
 
@@ -319,6 +326,14 @@ def train_ctc_model(
                             val_metrics = compute_ctc_validation_metrics(model, val_loader, device, validation_decoder)
                             model.train()
                             if wandb_run: wandb_run.log({f"val_step/{k}": v for k, v in val_metrics.items()}, step=optimizer_steps)
+
+                            # For plateau scheduler, we need to pass the validation metric
+                            if is_plateau_scheduler:
+                                # Get the value of early_stopping_metric
+                                plateau_metric_value = val_metrics.get(early_stopping_metric, float('inf'))
+                                # Step the scheduler with this metric
+                                logger.info(f"Stepping plateau scheduler with {early_stopping_metric} = {plateau_metric_value:.4f}")
+                                lr_scheduler.step(plateau_metric_value)
 
                             current_metric_value = val_metrics.get(best_metric_name, float('inf') if not higher_is_better else -float('inf'))
                             is_best_step = (current_metric_value < best_metric_value) if not higher_is_better else (current_metric_value > best_metric_value)
@@ -344,6 +359,11 @@ def train_ctc_model(
             model.train()
             epoch_val_metric = val_metrics.get(early_stopping_metric, float('inf') if not higher_is_better else -float('inf'))
 
+            # Update plateau scheduler based on validation metric at end of epoch
+            if is_plateau_scheduler:
+                logger.info(f"Stepping plateau scheduler with {early_stopping_metric} = {epoch_val_metric:.4f}")
+                lr_scheduler.step(epoch_val_metric)
+            
             # Log Epoch Metrics
             if wandb_run: wandb_run.log({"epoch": current_epoch_num, "train/loss_epoch": avg_train_loss, **{f"val/{k}": v for k, v in val_metrics.items()}, "progress/no_improvement_count": no_improvement_count, "progress/learning_rate_epoch": optimizer.param_groups[0]['lr']})
 

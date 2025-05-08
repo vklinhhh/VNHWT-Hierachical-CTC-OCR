@@ -15,7 +15,7 @@ from model.hierarchical_ctc_model import HierarchicalCtcMultiScaleOcrModel, Hier
 from data.ctc_ocr_dataset import CtcOcrDataset  # Reuse standard CTC dataset
 from data.ctc_collation import ctc_collate_fn  # Reuse standard CTC collate
 from training.ctc_trainer import train_ctc_model  # Reuse standard CTC trainer
-from utils.schedulers import CosineWarmupScheduler
+from utils.schedulers import CosineWarmupScheduler, CosineWarmupWithPlateauScheduler
 from utils.optimizers import create_optimizer
 from utils.ctc_utils import build_ctc_vocab, build_combined_vietnamese_charset  # Import builders
 
@@ -201,7 +201,7 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=7e-8)
     parser.add_argument('--val_split', type=float, default=0.1)
     parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--warmup_ratio', type=float, default=0.1)
+    parser.add_argument('--warmup_ratio', type=float, default=0.01)
     parser.add_argument('--grad_accumulation', type=int, default=1)
     parser.add_argument('--early_stopping_patience', type=int, default=10)
     parser.add_argument(
@@ -238,10 +238,29 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--discriminative_lr', action='store_true')
     parser.add_argument('--skip_final_eval', action='store_true')
-    parser.add_argument('--num_shared_layers', type=int, default=2)
+    parser.add_argument('--num_shared_layers', type=int, default=1)
     parser.add_argument('--encoder_lr_factor', type=float, default=0.1)
     parser.add_argument('--reset_scheduler_on_resume', action='store_true',
                         help="Reinitialize the LR scheduler when resuming training (useful if extending total epochs).")
+    
+    # NEW: Enhanced Diacritic Classifier Arguments
+    parser.add_argument('--use_visual_diacritic_attention', action='store_true',
+                       help='Enable Visual Diacritic Attention mechanism')
+    parser.add_argument('--use_character_diacritic_compatibility', action='store_true',
+                       help='Enable explicit Character-Diacritic Compatibility matrix')
+    parser.add_argument('--use_few_shot_diacritic_adapter', action='store_true',
+                       help='Enable Few-Shot Diacritic Adapter for rare combinations')
+    parser.add_argument('--num_few_shot_prototypes', type=int, default=5,
+                       help='Number of prototypes per diacritic class for few-shot adapter')
+    # NEW: LR Scheduler Arguments
+    parser.add_argument('--use_reduce_lr_on_plateau', action='store_true',
+                       help='Use ReduceLROnPlateau scheduler based on validation CER')
+    parser.add_argument('--plateau_patience', type=int, default=3,
+                       help='Number of epochs with no improvement after which LR will be reduced')
+    parser.add_argument('--plateau_factor', type=float, default=0.5,
+                       help='Factor by which the learning rate will be reduced')
+    parser.add_argument('--plateau_min_lr', type=float, default=1e-7,
+                       help='Minimum learning rate for plateau scheduler')
     args = parser.parse_args()
 
     # --- Setup ---
@@ -329,6 +348,11 @@ def main():
             classifier_dropout=args.classifier_dropout,
             blank_idx=combined_char_to_idx['<blank>'],
             num_shared_layers=args.num_shared_layers,
+            # NEW: Enhanced Diacritic Classifier settings
+            use_visual_diacritic_attention=args.use_visual_diacritic_attention,
+            use_character_diacritic_compatibility=args.use_character_diacritic_compatibility,
+            use_few_shot_diacritic_adapter=args.use_few_shot_diacritic_adapter,
+            num_few_shot_prototypes=args.num_few_shot_prototypes,
         )
 
         model_load_path = args.load_weights_from if args.load_weights_from else args.vision_encoder
@@ -337,6 +361,14 @@ def main():
         model = HierarchicalCtcMultiScaleOcrModel.from_pretrained(model_load_path, **init_kwargs) # Use NEW model class name
         processor = model.processor
         logger.info("Model and Processor initialized.")
+        
+        # Log information about enhanced diacritic classifiers
+        if args.use_visual_diacritic_attention:
+            logger.info("Visual Diacritic Attention mechanism ENABLED")
+        if args.use_character_diacritic_compatibility:
+            logger.info("Character-Diacritic Compatibility matrix ENABLED")
+        if args.use_few_shot_diacritic_adapter:
+            logger.info(f"Few-Shot Diacritic Adapter ENABLED with {args.num_few_shot_prototypes} prototypes per class")
 
     except Exception as model_init_e: logger.error(f"FATAL: Model init failed: {model_init_e}", exc_info=True); return 1
 
@@ -369,7 +401,28 @@ def main():
         total_steps = math.ceil(num_training_batches / args.grad_accumulation) * args.epochs
         warmup_steps = int(total_steps * args.warmup_ratio)
         logger.info(f'Scheduler Setup: Steps={total_steps}, Warmup={warmup_steps}')
-        lr_scheduler = CosineWarmupScheduler(optimizer, warmup_steps, total_steps)
+        # NEW: Create scheduler based on configuration
+        if args.use_reduce_lr_on_plateau:
+            # Create combined scheduler with plateau capability
+            logger.info(f"Using CosineWarmupWithPlateauScheduler: "
+                       f"plateau_patience={args.plateau_patience}, "
+                       f"plateau_factor={args.plateau_factor}, "
+                       f"metric='val_cer'")
+            lr_scheduler = CosineWarmupWithPlateauScheduler(
+                optimizer=optimizer,
+                warmup_steps=warmup_steps,
+                max_steps=int(total_steps * 0.5),  # Use plateau for latter half
+                plateau_patience=args.plateau_patience,
+                plateau_factor=args.plateau_factor,
+                plateau_min_lr=args.plateau_min_lr,
+                plateau_metric='val_cer',  # Hardcoded to monitor CER
+                plateau_mode='min'  # CER is better when lower
+            )
+        else:
+            # Use standard cosine warmup scheduler
+            logger.info(f"Using standard CosineWarmupScheduler")
+            lr_scheduler = CosineWarmupScheduler(optimizer, warmup_steps, total_steps)
+        
         logger.info('Optimizer/Scheduler created.')
     except Exception as opt_sched_e:
         logger.error(f'FATAL: Opt/Sched failed: {opt_sched_e}', exc_info=True)
@@ -409,8 +462,9 @@ def main():
             if load_optimizer_etc and lr_scheduler and 'lr_scheduler_state_dict' in checkpoint:
                 if args.reset_scheduler_on_resume:
                     logger.warning("Resetting LR scheduler state due to --reset_scheduler_on_resume flag.")    
-                    num_training_batches_new = math.ceil(len(train_dataset) / args.batch_size) # Needs train_dataset to be defined
-                    total_steps_new = math.ceil(num_training_batches_new / args.grad_accumulation) * args.epochs # Use NEW args.epochs
+                    num_training_batches_new = math.ceil(len(train_dataset) / args.batch_size)
+                    remaining_epochs = args.epochs - start_epoch
+                    total_steps_new = math.ceil(num_training_batches_new / args.grad_accumulation) * remaining_epochs
                     warmup_steps_new = int(total_steps_new * args.warmup_ratio)
                     # Create a NEW scheduler instance
                     optimizer = create_optimizer(
@@ -420,11 +474,45 @@ def main():
                                 args.discriminative_lr,
                                 args.encoder_lr_factor,
                             )
-                    lr_scheduler = CosineWarmupScheduler(optimizer, warmup_steps_new, total_steps_new, last_epoch=start_epoch-1) # Start from current epoch
-                    logger.info(f"Reinitialized LR scheduler for {args.epochs} total epochs. Current epoch: {start_epoch}")
+                    # Recreate scheduler based on configuration
+                    if args.use_reduce_lr_on_plateau:
+                        lr_scheduler = CosineWarmupWithPlateauScheduler(
+                            optimizer=optimizer,
+                            warmup_steps=warmup_steps_new,
+                            max_steps=int(total_steps_new * 0.5),
+                            plateau_patience=args.plateau_patience,
+                            plateau_factor=args.plateau_factor,
+                            plateau_min_lr=args.plateau_min_lr,
+                            plateau_metric='val_cer'
+                        )
+                    else:
+                        lr_scheduler = CosineWarmupScheduler(
+                            optimizer, warmup_steps_new, total_steps_new, last_epoch=start_epoch-1
+                        )
+                    logger.info(f"Reinitialized LR scheduler for {remaining_epochs} remaining epochs.")
                 else:
-                    lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
-                    logger.info("Scheduler state loaded from checkpoint.")
+                    try:
+                        if args.use_reduce_lr_on_plateau and isinstance(lr_scheduler, CosineWarmupWithPlateauScheduler):
+                            # Special handling for combined scheduler
+                            lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+                        else:
+                            lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+                        logger.info("Scheduler state loaded from checkpoint.")
+                    except Exception as sched_e:
+                        logger.warning(f"Error loading scheduler state: {sched_e}. Creating fresh scheduler.")
+                        # Fall back to recreating scheduler if loading fails
+                        if args.use_reduce_lr_on_plateau:
+                            lr_scheduler = CosineWarmupWithPlateauScheduler(
+                                optimizer=optimizer,
+                                warmup_steps=warmup_steps,
+                                max_steps=int(total_steps * 0.5),
+                                plateau_patience=args.plateau_patience,
+                                plateau_factor=args.plateau_factor,
+                                plateau_min_lr=args.plateau_min_lr,
+                                plateau_metric='val_cer'
+                            )
+                        else:
+                            lr_scheduler = CosineWarmupScheduler(optimizer, warmup_steps, total_steps)
             # *** ALWAYS try to load scaler state if found ***
             if load_optimizer_etc and args.use_amp and 'scaler_state_dict' in checkpoint:
                 scaler_state_to_load = checkpoint['scaler_state_dict'] # Assign state
