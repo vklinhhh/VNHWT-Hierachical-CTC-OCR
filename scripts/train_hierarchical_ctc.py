@@ -261,6 +261,11 @@ def main():
                        help='Factor by which the learning rate will be reduced')
     parser.add_argument('--plateau_min_lr', type=float, default=1e-7,
                        help='Minimum learning rate for plateau scheduler')
+    parser.add_argument(
+    '--no_augment',
+    action='store_true', # This makes it a flag, default is False
+    help="Disable training data augmentations."
+)
     args = parser.parse_args()
 
     # --- Setup ---
@@ -377,10 +382,10 @@ def main():
         logger.info('Creating CTC dataset wrappers (using combined vocab)...')
         # Use the standard CtcOcrDataset, but pass the COMBINED char map
         train_dataset = CtcOcrDataset(
-            train_hf_split, processor, combined_char_to_idx, unk_token='[UNK]'
+            train_hf_split, processor, combined_char_to_idx, unk_token='[UNK]', is_training=not args.no_augment
         )
         val_dataset = CtcOcrDataset(
-            val_hf_split, processor, combined_char_to_idx, unk_token='[UNK]'
+            val_hf_split, processor, combined_char_to_idx, unk_token='[UNK]', is_training=False
         )
         logger.info('CTC Dataset wrappers created.')
     except Exception as dataset_wrap_e:
