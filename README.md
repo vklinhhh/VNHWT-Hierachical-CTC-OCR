@@ -56,3 +56,13 @@ This architecture attempts to leverage the linguistic structure (Diacritic depen
 │   └── main_training_hierarchical.log
 ├── README_hierarchical.md      # This file
 └── requirements_hierarchical.txt # Dependencies
+
+
+```bash
+#training 
+python -m scripts.train_hierarchical_ctc   --dataset_name vklinhhh/vnhwt_opt_1   --vision_encoder microsoft/trocr-base-handwritten   --output_dir outputs/hierarchical_enhanced_diacritics   --use_visual_diacritic_attention   --use_character_diacritic_compatibility   --use_few_shot_diacritic_adapter   --num_few_shot_prototypes 10   --epochs 100   --batch_size 16   --learning_rate 5e-5   --fusion_method add   --use_amp
+
+
+```bash
+#demo
+python -m scripts.demo_enhanced_diacritics   --model_path outputs/hierarchical_enhanced_diacritics/best_model_hf   --combined_char_vocab_path outputs/hierarchical_enhanced_diacritics/combined_char_vocab.json   --image_path Screenshotfrom2025-05-0516-38-34.png   --output_dir demo_outputs
