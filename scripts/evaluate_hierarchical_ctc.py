@@ -655,10 +655,10 @@ def create_diacritic_html_report(report_path, diacritic_results, model_path, viz
 if __name__ == "__main__":
     # ... (Argument parsing remains the same as evaluate_ctc.py) ...
     parser = argparse.ArgumentParser(description="Evaluate a trained Hierarchical CTC OCR model.")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to trained Hierarchical CTC model directory")
-    parser.add_argument("--combined_char_vocab_path", type=str, required=True, help="Path to COMBINED char vocab JSON")
-    parser.add_argument("--dataset_name", type=str, required=True, help="Test dataset name/path.")
-    parser.add_argument("--dataset_split", type=str, default="test")
+    parser.add_argument("--model_path", type=str, default="outputs/hierarchical_enhanced_diacritics/best_model_hf", help="Path to trained Hierarchical CTC model directory")
+    parser.add_argument("--combined_char_vocab_path", type=str, default="outputs/hierarchical_enhanced_diacritics/combined_char_vocab.json", help="Path to COMBINED char vocab JSON")
+    parser.add_argument("--dataset_name", type=str, default="vklinhhh/test_vietnamese_cwl", help="Test dataset name/path.")
+    parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--output_dir", type=str, default="evaluation_results_hierarchical_ctc")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
